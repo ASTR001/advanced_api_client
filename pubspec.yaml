@@ -1,0 +1,28 @@
+name: advanced_api_client
+description: "A Flutter package to simplify API requests, including RESTful CRUD, file uploads, and pagination."
+
+version: 0.0.1
+
+homepage: "https://github.com/yourusername/advanced_api_client"
+repository: "https://github.com/yourusername/advanced_api_client"
+documentation: "https://github.com/yourusername/advanced_api_client#readme"
+issue_tracker: "https://github.com/yourusername/advanced_api_client/issues"
+license: MIT
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  dio: ^5.9.1
+  shared_preferences: ^2.5.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

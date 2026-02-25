@@ -1,0 +1,22 @@
+name: advanced_api_client_example
+description: A simple Flutter package for advanced API client usage.
+version: 0.0.1
+
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  advanced_api_client:
+    path: ../
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
