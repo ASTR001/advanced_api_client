@@ -4,22 +4,18 @@ import '../../advanced_api_client.dart';
 
 class AuthInterceptor extends Interceptor {
   final AdvancedApiClient client;
-
   Completer<bool>? _refreshCompleter;
 
   AuthInterceptor(this.client);
 
   @override
   void onRequest(
-    RequestOptions options,
-    RequestInterceptorHandler handler,
-  ) async {
+      RequestOptions options, RequestInterceptorHandler handler) async {
     final token = await client.tokenStorage.getToken();
 
     if (token != null && options.headers["Skip-Auth"] != true) {
       options.headers["Authorization"] = "Bearer $token";
     }
-
     options.headers.remove("Skip-Auth");
 
     handler.next(options);
@@ -31,15 +27,18 @@ class AuthInterceptor extends Interceptor {
       return handler.next(err);
     }
 
-    if (err.response?.statusCode != 401 ||
-        client.config.refreshConfig == null) {
+    final statusCode = err.response?.statusCode;
+    final isAuthError =
+        statusCode == 401 || statusCode == 403 || _isTokenExpired(err);
+
+    if (!isAuthError || client.config.refreshConfig == null) {
       return handler.next(err);
     }
 
     final request = err.requestOptions;
 
     if (request.extra["retrying"] == true) {
-      return handler.next(err);
+      return handler.next(err); // Prevent infinite loop
     }
 
     try {
@@ -50,7 +49,6 @@ class AuthInterceptor extends Interceptor {
       }
 
       request.extra["retrying"] = true;
-
       final newToken = await client.tokenStorage.getToken();
 
       if (newToken != null) {
@@ -58,17 +56,25 @@ class AuthInterceptor extends Interceptor {
       }
 
       final response = await client.dio.fetch(request);
-
-      return handler.resolve(response);
+      handler.resolve(response);
     } catch (_) {
-      return handler.next(err);
+      handler.next(err);
     }
   }
 
-  Future<bool> _refreshToken() async {
-    if (_refreshCompleter != null) {
-      return _refreshCompleter!.future;
+  bool _isTokenExpired(DioException err) {
+    // Customize depending on API response
+    final data = err.response?.data;
+    if (data is Map<String, dynamic>) {
+      final message = data["message"]?.toString().toLowerCase() ?? "";
+      return message.contains("token expired") ||
+          message.contains("invalid token");
     }
+    return false;
+  }
+
+  Future<bool> _refreshToken() async {
+    if (_refreshCompleter != null) return _refreshCompleter!.future;
 
     _refreshCompleter = Completer<bool>();
 
@@ -80,7 +86,10 @@ class AuthInterceptor extends Interceptor {
       _refreshCompleter!.complete(false);
       return false;
     } finally {
-      _refreshCompleter = null;
+      // Prevent race condition: only reset if future is complete
+      if (_refreshCompleter!.isCompleted) {
+        _refreshCompleter = null;
+      }
     }
   }
 }

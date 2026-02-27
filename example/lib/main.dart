@@ -381,7 +381,7 @@ class _PaginatedObjectsScreenState extends State<PaginatedObjectsScreen> {
     }
 
     try {
-      final data = await AdvancedApiClient.instance.getPaginated(
+      final data = await AdvancedApiClient.instance.get(
         endpoint: "/products",
         query: {"limit": limit, "offset": page},
         withToken: false,

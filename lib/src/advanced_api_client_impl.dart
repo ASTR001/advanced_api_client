@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:dio/dio.dart';
-import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../advanced_api_client.dart';
 
 class AdvancedApiClient {
   static AdvancedApiClient? _instance;
+  static ApiConfig? _defaultConfig;
+  static TokenStorage? _defaultStorage;
 
   final Dio dio;
   final TokenStorage tokenStorage;
@@ -14,35 +16,65 @@ class AdvancedApiClient {
 
   CancelToken _globalCancelToken = CancelToken();
 
+  // ==========================================================
+  // 🔐 PRIVATE CONSTRUCTOR
+  // ==========================================================
+
   AdvancedApiClient._internal({
     required this.config,
     required this.tokenStorage,
   }) : dio = Dio(
-         BaseOptions(
-           baseUrl: config.baseUrl,
-           headers: {"Content-Type": "application/json"},
-         ),
-       ) {
-    // Default interceptors
+          BaseOptions(
+            baseUrl: config.baseUrl,
+            headers: const {"Content-Type": "application/json"},
+            connectTimeout: const Duration(seconds: 50),
+            receiveTimeout: const Duration(seconds: 50),
+            sendTimeout: const Duration(seconds: 50),
+          ),
+        ) {
     dio.interceptors.add(AuthInterceptor(this));
     dio.interceptors.add(RetryInterceptor(dio));
 
-    // Optional custom interceptors from config
     if (config.interceptors != null) {
       dio.interceptors.addAll(config.interceptors!);
     }
   }
 
-  // ================= AUTO INITIALIZE =================
+  // ==========================================================
+  // 🚀 INITIALIZATION
+  // ==========================================================
 
   static Future<void> initialize({required ApiConfig config}) async {
     final prefs = await SharedPreferences.getInstance();
-    final storage = SharedPrefsTokenStorage(prefs);
+    _defaultStorage = SharedPrefsTokenStorage(prefs);
+    _defaultConfig = config;
 
     _instance = AdvancedApiClient._internal(
       config: config,
-      tokenStorage: storage,
+      tokenStorage: _defaultStorage!,
     );
+  }
+
+  static Future<AdvancedApiClient> getInstance() async {
+    if (_instance != null) return _instance!;
+
+    if (_defaultConfig == null) {
+      throw Exception(
+        "AdvancedApiClient is not initialized. Call initialize() first.",
+      );
+    }
+
+    if (_defaultStorage == null) {
+      final prefs = await SharedPreferences.getInstance();
+      _defaultStorage = SharedPrefsTokenStorage(prefs);
+    }
+
+    _instance = AdvancedApiClient._internal(
+      config: _defaultConfig!,
+      tokenStorage: _defaultStorage!,
+    );
+
+    return _instance!;
   }
 
   static AdvancedApiClient get instance {
@@ -53,7 +85,7 @@ class AdvancedApiClient {
   }
 
   // ==========================================================
-  // 🔥 CORE REQUEST METHOD
+  // 🌐 CORE REQUEST
   // ==========================================================
 
   Future<dynamic> _request({
@@ -66,12 +98,8 @@ class AdvancedApiClient {
     Map<String, dynamic>? headers,
   }) async {
     final safeQuery = query?.map(
-      (key, value) => MapEntry(key, value.toString()),
+      (k, v) => MapEntry(k, v?.toString()),
     );
-
-    final uri = Uri.parse(
-      dio.options.baseUrl + endpoint,
-    ).replace(queryParameters: safeQuery);
 
     final options = Options(
       method: method,
@@ -81,205 +109,153 @@ class AdvancedApiClient {
       },
     );
 
-    debugPrint("========== API REQUEST ==========");
-    debugPrint("Full URL: $uri");
-    debugPrint("Method: $method");
+    final uri = Uri.parse(dio.options.baseUrl + endpoint)
+        .replace(queryParameters: safeQuery);
 
-    if (data is FormData) {
-      debugPrint("Body: FormData {");
-      for (var f in data.fields) {
-        debugPrint("  Field - ${f.key}: ${f.value}");
-      }
-      for (var f in data.files) {
-        debugPrint("  File  - ${f.key}: ${f.value.filename}");
-      }
-      debugPrint("}");
-    } else {
-      debugPrint("Body: $data");
-    }
-
-    debugPrint("Headers: ${options.headers}");
-    debugPrint("=================================");
+    _logRequest(uri, method, data, options.headers);
 
     try {
       final response = await dio.request(
         endpoint,
         data: data,
-        queryParameters: query,
+        queryParameters: safeQuery,
         options: options,
         cancelToken: cancelToken ?? _globalCancelToken,
       );
 
-      debugPrint("========== API RESPONSE ==========");
-      debugPrint("Full URL: $uri");
-      debugPrint("Status Code: ${response.statusCode}");
-      debugPrint("Response Data: ${response.data}");
-      debugPrint("==================================");
+      _logResponse(uri, response);
 
-      final responseData = response.data;
-
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        return responseData;
+      if (response.statusCode != null &&
+          response.statusCode! >= 200 &&
+          response.statusCode! < 300) {
+        return response.data;
       }
 
       throw ApiException(
-        message: "HTTP Error: ${response.statusCode}",
+        message: "HTTP Error ${response.statusCode}",
         statusCode: response.statusCode,
-        data: responseData,
+        data: response.data,
       );
     } on DioException catch (e) {
-      debugPrint("========== API ERROR ============");
-      debugPrint("Full URL: $uri");
-      debugPrint("Error Type: ${e.type}");
-      debugPrint("Status Code: ${e.response?.statusCode}");
-      debugPrint("Response Data: ${e.response?.data}");
-      debugPrint("Message: ${e.message}");
-      debugPrint("=================================");
-
       throw _handleError(e);
-    } catch (e, st) {
-      debugPrint("========== UNKNOWN ERROR ==========");
-      debugPrint("Full URL: $uri");
-      debugPrint("Error: $e");
-      debugPrint("StackTrace: $st");
-      debugPrint("===================================");
-
-      rethrow;
     }
   }
 
   // ==========================================================
-  // 🔄 PAGINATION REQUEST WRAPPER
-  // ==========================================================
-
-  Future<dynamic> getPaginated({
-    required String endpoint,
-    Map<String, dynamic>? query,
-    bool withToken = true,
-  }) async {
-    try {
-      final data = await _request(
-        endpoint: endpoint,
-        method: "GET",
-        query: query,
-        withToken: withToken,
-      );
-      debugPrint("Paginated Response: $data"); // log here
-      return data;
-    } catch (e, st) {
-      debugPrint("Error in getPaginated: $e");
-      debugPrint("StackTrace: $st");
-      rethrow;
-    }
-  }
-
-  // ==========================================================
-  // HTTP METHODS
+  // 📦 HTTP METHODS
   // ==========================================================
 
   Future<dynamic> get({
     required String endpoint,
     Map<String, dynamic>? query,
     bool withToken = true,
-  }) {
-    return _request(
-      endpoint: endpoint,
-      method: "GET",
-      query: query,
-      withToken: withToken,
-    );
-  }
+  }) =>
+      _request(
+        endpoint: endpoint,
+        method: "GET",
+        query: query,
+        withToken: withToken,
+      );
 
   Future<dynamic> post({
     required String endpoint,
     dynamic body,
     bool withToken = true,
-  }) {
-    return _request(
-      endpoint: endpoint,
-      method: "POST",
-      data: body,
-      withToken: withToken,
-    );
-  }
+  }) =>
+      _request(
+        endpoint: endpoint,
+        method: "POST",
+        data: body,
+        withToken: withToken,
+      );
 
   Future<dynamic> put({
     required String endpoint,
     dynamic body,
     bool withToken = true,
-  }) {
-    return _request(
-      endpoint: endpoint,
-      method: "PUT",
-      data: body,
-      withToken: withToken,
-    );
-  }
+  }) =>
+      _request(
+        endpoint: endpoint,
+        method: "PUT",
+        data: body,
+        withToken: withToken,
+      );
 
   Future<dynamic> patch({
     required String endpoint,
     dynamic body,
     bool withToken = true,
-  }) {
-    return _request(
-      endpoint: endpoint,
-      method: "PATCH",
-      data: body,
-      withToken: withToken,
-    );
-  }
+  }) =>
+      _request(
+        endpoint: endpoint,
+        method: "PATCH",
+        data: body,
+        withToken: withToken,
+      );
 
   Future<dynamic> delete({
     required String endpoint,
     dynamic body,
     bool withToken = true,
-  }) {
-    return _request(
-      endpoint: endpoint,
-      method: "DELETE",
-      data: body,
-      withToken: withToken,
-    );
-  }
+  }) =>
+      _request(
+        endpoint: endpoint,
+        method: "DELETE",
+        data: body,
+        withToken: withToken,
+      );
 
   // ==========================================================
-  // 📤 FILE / IMAGE UPLOAD
+  // 📤 FILE UPLOAD
   // ==========================================================
 
   Future<dynamic> uploadFile({
     required String endpoint,
     required String filePath,
-    String fileField = "file",
+    String? fileField,
     Map<String, dynamic>? fields,
     bool withToken = true,
   }) async {
-    final file = File(filePath);
-    if (!await file.exists()) {
-      debugPrint("========== FILE NOT FOUND ==========");
-      debugPrint("File Path: $filePath");
-      debugPrint("====================================");
-      throw Exception("File not found at $filePath");
+    return uploadFiles(
+      endpoint: endpoint,
+      files: [filePath],
+      fileField: fileField,
+      fields: fields,
+      withToken: withToken,
+    );
+  }
+
+  Future<dynamic> uploadFiles({
+    required String endpoint,
+    required List<String> files,
+    String? fileField,
+    Map<String, dynamic>? fields,
+    bool withToken = true,
+  }) async {
+    if (files.isEmpty) {
+      throw Exception("No files provided for upload");
     }
 
-    debugPrint("========== FILE UPLOAD ==========");
-    debugPrint("Full URL: ${dio.options.baseUrl}$endpoint");
-    debugPrint("File Path: $filePath");
-    debugPrint("Fields: $fields");
-    debugPrint("Headers: ${{"Content-Type": "multipart/form-data"}}");
-    debugPrint("=================================");
+    final formData = FormData();
+    final fieldName = fileField ?? "file";
 
-    final formData = FormData.fromMap({
-      if (fields != null) ...fields,
-      fileField: await MultipartFile.fromFile(filePath),
-    });
-
-    // Log FormData properly
-    debugPrint("FormData fields:");
-    for (var f in formData.fields) {
-      debugPrint("${f.key}: ${f.value}");
+    if (fields != null) {
+      formData.fields.addAll(
+        fields.entries.map(
+          (e) => MapEntry(e.key, e.value?.toString() ?? ""),
+        ),
+      );
     }
-    for (var f in formData.files) {
-      debugPrint("${f.key}: ${f.value.filename}");
+
+    for (final path in files) {
+      final file = File(path);
+      if (!await file.exists()) {
+        throw Exception("File not found: $path");
+      }
+
+      formData.files.add(
+        MapEntry(fieldName, await MultipartFile.fromFile(path)),
+      );
     }
 
     return _request(
@@ -287,7 +263,45 @@ class AdvancedApiClient {
       method: "POST",
       data: formData,
       withToken: withToken,
-      headers: {"Content-Type": "multipart/form-data"},
+    );
+  }
+
+  Future<dynamic> uploadMultipleFiles({
+    required String endpoint,
+    required Map<String, String> files,
+    Map<String, dynamic>? fields,
+    bool withToken = true,
+  }) async {
+    if (files.isEmpty) {
+      throw Exception("No files provided for upload");
+    }
+
+    final formData = FormData();
+
+    if (fields != null) {
+      formData.fields.addAll(
+        fields.entries.map(
+          (e) => MapEntry(e.key, e.value?.toString() ?? ""),
+        ),
+      );
+    }
+
+    for (final entry in files.entries) {
+      final file = File(entry.value);
+      if (!await file.exists()) {
+        throw Exception("File not found: ${entry.value}");
+      }
+
+      formData.files.add(
+        MapEntry(entry.key, await MultipartFile.fromFile(entry.value)),
+      );
+    }
+
+    return _request(
+      endpoint: endpoint,
+      method: "POST",
+      data: formData,
+      withToken: withToken,
     );
   }
 
@@ -300,7 +314,6 @@ class AdvancedApiClient {
     if (refresh == null) return false;
 
     try {
-      debugPrint("========== REFRESH TOKEN ==========");
       final response = await dio.request(
         refresh.path,
         data: refresh.body,
@@ -309,18 +322,12 @@ class AdvancedApiClient {
         cancelToken: _globalCancelToken,
       );
 
-      debugPrint("Refresh Response: ${response.data}");
-
       final newToken = refresh.tokenParser(response.data);
       if (newToken == null) return false;
 
       await tokenStorage.saveToken(newToken);
-
-      debugPrint("Token Saved Successfully");
-      debugPrint("===================================");
       return true;
-    } catch (e) {
-      debugPrint("Refresh Failed: $e");
+    } catch (_) {
       return false;
     }
   }
@@ -339,45 +346,82 @@ class AdvancedApiClient {
   }
 
   // ==========================================================
-  // ERROR HANDLING
+  // ❗ ERROR HANDLING
   // ==========================================================
 
   ApiException _handleError(DioException e) {
-    if (CancelToken.isCancel(e)) {
-      return ApiException(message: "Request Cancelled");
-    }
+    config.onError?.call(e, e.requestOptions);
 
-    if (e.response != null) {
-      final statusCode = e.response?.statusCode;
-      final responseData = e.response?.data;
+    final statusCode = e.response?.statusCode;
+    final responseData = e.response?.data;
 
-      String message = "Server Error";
-      if (responseData is Map<String, dynamic>) {
-        message =
-            responseData["message"]?.toString() ??
-            responseData["error"]?.toString() ??
-            e.response?.statusMessage ??
-            "Server Error";
-      } else if (responseData is String) {
-        message = responseData;
-      }
-
-      return ApiException(
-        message: message,
-        statusCode: statusCode,
-        data: responseData,
-      );
-    }
+    String message;
 
     switch (e.type) {
       case DioExceptionType.connectionTimeout:
-        return ApiException(message: "Connection Timeout");
+        message = "Connection Timeout";
+        break;
+      case DioExceptionType.sendTimeout:
+        message = "Send Timeout";
+        break;
       case DioExceptionType.receiveTimeout:
-        return ApiException(message: "Receive Timeout");
+        message = "Receive Timeout";
+        break;
       case DioExceptionType.connectionError:
-        return ApiException(message: "No Internet Connection");
+        message = "No Internet Connection";
+        break;
+      case DioExceptionType.badCertificate:
+        message = "Bad SSL Certificate";
+        break;
+      case DioExceptionType.badResponse:
+        if (responseData is Map<String, dynamic>) {
+          message = responseData["message"]?.toString() ??
+              responseData["error"]?.toString() ??
+              "Server Error";
+        } else if (responseData is String) {
+          message = responseData;
+        } else {
+          message = "Server Error";
+        }
+        break;
       default:
-        return ApiException(message: "Unknown Error");
+        message = e.message ?? "Unexpected Error";
     }
+
+    return ApiException(
+      message: message,
+      statusCode: statusCode,
+      data: responseData,
+    );
+  }
+
+  // ==========================================================
+  // 🧾 LOGGING
+  // ==========================================================
+
+  void _logRequest(
+    Uri uri,
+    String method,
+    dynamic data,
+    Map<String, dynamic>? headers,
+  ) {
+    if (!kDebugMode) return;
+
+    debugPrint("========== API REQUEST ==========");
+    debugPrint("URL: $uri");
+    debugPrint("Method: $method");
+    debugPrint("Headers: $headers");
+    debugPrint("Body: $data");
+    debugPrint("=================================");
+  }
+
+  void _logResponse(Uri uri, Response response) {
+    if (!kDebugMode) return;
+
+    debugPrint("========== API RESPONSE ==========");
+    debugPrint("URL: $uri");
+    debugPrint("Status: ${response.statusCode}");
+    debugPrint("Data: ${response.data}");
+    debugPrint("==================================");
   }
 }
