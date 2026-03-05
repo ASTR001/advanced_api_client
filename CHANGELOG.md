@@ -4,6 +4,30 @@ All notable changes to this package will be documented in this file.
 
 ---
 
+## 1.0.1
+
+### 🛠 Bug Fixes
+- Fixed _FormData already finalized error when retrying uploads after token refresh.
+- Resolved bodyBuilder missing issue in RefreshConfig for dynamic refresh API bodies.
+- Corrected named parameter mismatches in _request() and Dio request options.
+- Prevented token refresh infinite loops on concurrent requests.
+
+### Added
+- Support for bodyBuilder in RefreshConfig for dynamic refresh request bodies.
+- Ability to fetch user_id or other dynamic data from SharedPreferences during token refresh.
+- Optional CancelToken support per upload task for better upload management.
+- Improved logging for upload progress and retry actions.
+- Dynamic handling of multiple file uploads with different field names.
+- Added SharedPrefsTokenStorage example for storing token and extra data separately.
+
+### Improved
+- Safer retry mechanism for POST/PUT requests using FormData after token refresh.
+- Cleaner interceptor logs and separation between auth and upload flows.
+- More robust _request() core function with error parsing improvements.
+- Improved production safety and scalability of AdvancedApiClient.
+
+---
+
 ## 1.0.0
 
 ### 🚀 Production Release

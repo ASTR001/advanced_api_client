@@ -1,7 +1,5 @@
 import 'dart:async';
-import 'dart:io';
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../advanced_api_client.dart';
 
@@ -13,6 +11,8 @@ class AdvancedApiClient {
   final Dio dio;
   final TokenStorage tokenStorage;
   final ApiConfig config;
+
+  final Map<String, CancelToken> _uploadTokens = {};
 
   CancelToken _globalCancelToken = CancelToken();
 
@@ -26,25 +26,34 @@ class AdvancedApiClient {
   }) : dio = Dio(
           BaseOptions(
             baseUrl: config.baseUrl,
-            headers: const {"Content-Type": "application/json"},
             connectTimeout: const Duration(seconds: 50),
             receiveTimeout: const Duration(seconds: 50),
             sendTimeout: const Duration(seconds: 50),
           ),
         ) {
-    dio.interceptors.add(AuthInterceptor(this));
+    // Retry FIRST
     dio.interceptors.add(RetryInterceptor(dio));
 
+    // Custom interceptors
     if (config.interceptors != null) {
       dio.interceptors.addAll(config.interceptors!);
     }
+
+    // AUTH LAST
+    dio.interceptors.add(AuthInterceptor(this));
+
+    ApiLogger.request("AdvancedApiClient initialized");
   }
 
   // ==========================================================
   // 🚀 INITIALIZATION
   // ==========================================================
 
-  static Future<void> initialize({required ApiConfig config}) async {
+  static Future<void> initialize({
+    required ApiConfig config,
+  }) async {
+    ApiLogger.enabled = config.enableLogs;
+
     final prefs = await SharedPreferences.getInstance();
     _defaultStorage = SharedPrefsTokenStorage(prefs);
     _defaultConfig = config;
@@ -96,17 +105,22 @@ class AdvancedApiClient {
     bool withToken = true,
     CancelToken? cancelToken,
     Map<String, dynamic>? headers,
+    void Function(int sent, int total)? onSendProgress,
+    dynamic Function()? dataBuilder,
   }) async {
     final safeQuery = query?.map(
       (k, v) => MapEntry(k, v?.toString()),
     );
 
+    final mergedHeaders = {
+      if (config.headers != null) ...config.headers!, // global headers
+      if (!withToken) "Skip-Auth": true, // auth skip
+      if (headers != null) ...headers, // request headers
+    };
+
     final options = Options(
       method: method,
-      headers: {
-        if (!withToken) "Skip-Auth": true,
-        if (headers != null) ...headers,
-      },
+      headers: mergedHeaders,
     );
 
     final uri = Uri.parse(dio.options.baseUrl + endpoint)
@@ -114,13 +128,22 @@ class AdvancedApiClient {
 
     _logRequest(uri, method, data, options.headers);
 
+    final safeOptions = (options).copyWith(
+      extra: {
+        if (dataBuilder != null) "_dataBuilder": dataBuilder,
+        if (options.extra != null)
+          ...options.extra!, // preserve any existing extras
+      },
+    );
+
     try {
       final response = await dio.request(
         endpoint,
         data: data,
         queryParameters: safeQuery,
-        options: options,
+        options: safeOptions,
         cancelToken: cancelToken ?? _globalCancelToken,
+        onSendProgress: onSendProgress,
       );
 
       _logResponse(uri, response);
@@ -137,6 +160,11 @@ class AdvancedApiClient {
         data: response.data,
       );
     } on DioException catch (e) {
+      final errorBody = e.response?.data;
+
+      ApiLogger.error(
+        "$method $uri → ${e.response?.statusCode} ${errorBody ?? e.error ?? 'Unknown error'}",
+      );
       throw _handleError(e);
     }
   }
@@ -149,186 +177,150 @@ class AdvancedApiClient {
     required String endpoint,
     Map<String, dynamic>? query,
     bool withToken = true,
+    Map<String, dynamic>? headers,
   }) =>
       _request(
         endpoint: endpoint,
         method: "GET",
         query: query,
         withToken: withToken,
+        headers: headers,
       );
 
   Future<dynamic> post({
     required String endpoint,
     dynamic body,
     bool withToken = true,
+    Map<String, dynamic>? headers,
   }) =>
       _request(
         endpoint: endpoint,
         method: "POST",
         data: body,
         withToken: withToken,
+        headers: headers,
       );
 
   Future<dynamic> put({
     required String endpoint,
     dynamic body,
     bool withToken = true,
+    Map<String, dynamic>? headers,
   }) =>
       _request(
         endpoint: endpoint,
         method: "PUT",
         data: body,
         withToken: withToken,
+        headers: headers,
       );
 
   Future<dynamic> patch({
     required String endpoint,
     dynamic body,
     bool withToken = true,
+    Map<String, dynamic>? headers,
   }) =>
       _request(
         endpoint: endpoint,
         method: "PATCH",
         data: body,
         withToken: withToken,
+        headers: headers,
       );
 
   Future<dynamic> delete({
     required String endpoint,
     dynamic body,
     bool withToken = true,
+    Map<String, dynamic>? headers,
   }) =>
       _request(
         endpoint: endpoint,
         method: "DELETE",
         data: body,
         withToken: withToken,
+        headers: headers,
       );
 
   // ==========================================================
-  // 📤 FILE UPLOAD
+  // 📤 FILE UPLOAD (With Progress + Cancel Support)
   // ==========================================================
 
   Future<dynamic> uploadFile({
     required String endpoint,
-    required String filePath,
-    String? fileField,
+    required Map<String, List<String>> files,
     Map<String, dynamic>? fields,
     bool withToken = true,
+    void Function(int sent, int total)? onProgress,
+    String? uploadId,
+    Map<String, dynamic>? headers,
   }) async {
-    return uploadFiles(
-      endpoint: endpoint,
-      files: [filePath],
-      fileField: fileField,
-      fields: fields,
-      withToken: withToken,
-    );
-  }
+    if (files.isEmpty) throw Exception("No files provided");
 
-  Future<dynamic> uploadFiles({
-    required String endpoint,
-    required List<String> files,
-    String? fileField,
-    Map<String, dynamic>? fields,
-    bool withToken = true,
-  }) async {
-    if (files.isEmpty) {
-      throw Exception("No files provided for upload");
-    }
-
-    final formData = FormData();
-    final fieldName = fileField ?? "file";
-
-    if (fields != null) {
-      formData.fields.addAll(
-        fields.entries.map(
-          (e) => MapEntry(e.key, e.value?.toString() ?? ""),
+    FormData buildFormData() => FormData()
+      ..fields.addAll(
+        fields?.entries.map((e) => MapEntry(e.key, e.value.toString())) ?? [],
+      )
+      ..files.addAll(
+        files.entries.expand(
+          (entry) => entry.value.map(
+            (path) => MapEntry(
+              entry.key,
+              MultipartFile.fromFileSync(path),
+            ),
+          ),
         ),
       );
+
+    CancelToken? token;
+    if (uploadId != null) {
+      token = _uploadTokens.putIfAbsent(uploadId, () => CancelToken());
     }
 
-    for (final path in files) {
-      final file = File(path);
-      if (!await file.exists()) {
-        throw Exception("File not found: $path");
-      }
-
-      formData.files.add(
-        MapEntry(fieldName, await MultipartFile.fromFile(path)),
-      );
-    }
-
-    return _request(
-      endpoint: endpoint,
-      method: "POST",
-      data: formData,
-      withToken: withToken,
-    );
-  }
-
-  Future<dynamic> uploadMultipleFiles({
-    required String endpoint,
-    required Map<String, String> files,
-    Map<String, dynamic>? fields,
-    bool withToken = true,
-  }) async {
-    if (files.isEmpty) {
-      throw Exception("No files provided for upload");
-    }
-
-    final formData = FormData();
-
-    if (fields != null) {
-      formData.fields.addAll(
-        fields.entries.map(
-          (e) => MapEntry(e.key, e.value?.toString() ?? ""),
-        ),
-      );
-    }
-
-    for (final entry in files.entries) {
-      final file = File(entry.value);
-      if (!await file.exists()) {
-        throw Exception("File not found: ${entry.value}");
-      }
-
-      formData.files.add(
-        MapEntry(entry.key, await MultipartFile.fromFile(entry.value)),
-      );
-    }
-
-    return _request(
-      endpoint: endpoint,
-      method: "POST",
-      data: formData,
-      withToken: withToken,
-    );
-  }
-
-  // ==========================================================
-  // 🔄 TOKEN REFRESH
-  // ==========================================================
-
-  Future<bool> executeRefresh() async {
-    final refresh = config.refreshConfig;
-    if (refresh == null) return false;
+    ApiLogger.upload("Uploading to $endpoint (task: $uploadId)");
 
     try {
-      final response = await dio.request(
-        refresh.path,
-        data: refresh.body,
-        queryParameters: refresh.query,
-        options: refresh.toOptions(),
-        cancelToken: _globalCancelToken,
+      return await _request(
+        endpoint: endpoint,
+        method: "POST",
+        data: buildFormData(), // initial upload
+        dataBuilder: buildFormData, // builder for retries
+        withToken: withToken,
+        cancelToken: token,
+        headers: {
+          "Content-Type": "multipart/form-data",
+          if (config.headers != null) ...config.headers!, // global headers
+          if (headers != null) ...headers, // request headers
+        },
+        onSendProgress: onProgress,
       );
+    } finally {
+      if (uploadId != null) _uploadTokens.remove(uploadId);
+      ApiLogger.upload("Upload finished (task: $uploadId)");
+    }
+  }
 
-      final newToken = refresh.tokenParser(response.data);
-      if (newToken == null) return false;
+  // ==========================================================
+  // 🔄 CREATE UPLOAD TASK
+  // ==========================================================
 
-      await tokenStorage.saveToken(newToken);
-      return true;
-    } catch (_) {
-      return false;
+  String createUploadTask() {
+    final id =
+        "${DateTime.now().microsecondsSinceEpoch}_${_uploadTokens.length}";
+    _uploadTokens[id] = CancelToken();
+    return id;
+  }
+
+  // ==========================================================
+  // 🔄 CANCEL UPLOAD
+  // ==========================================================
+
+  void cancelUpload(String uploadId) {
+    final token = _uploadTokens.remove(uploadId);
+
+    if (token != null && !token.isCancelled) {
+      token.cancel("Upload cancelled by user");
     }
   }
 
@@ -343,6 +335,8 @@ class AdvancedApiClient {
 
     await tokenStorage.clear();
     _globalCancelToken = CancelToken();
+
+    ApiLogger.auth("Session terminated");
   }
 
   // ==========================================================
@@ -405,23 +399,54 @@ class AdvancedApiClient {
     dynamic data,
     Map<String, dynamic>? headers,
   ) {
-    if (!kDebugMode) return;
+    if (!ApiLogger.enabled) return;
 
-    debugPrint("========== API REQUEST ==========");
-    debugPrint("URL: $uri");
-    debugPrint("Method: $method");
-    debugPrint("Headers: $headers");
-    debugPrint("Body: $data");
-    debugPrint("=================================");
+    ApiLogger.divider("REQUEST");
+    ApiLogger.request("$method $uri");
+
+    if (headers != null && headers.isNotEmpty) {
+      ApiLogger.request("Headers:");
+      headers.forEach((key, value) {
+        ApiLogger.request("  $key: $value");
+      });
+    }
+
+    if (data != null) {
+      if (data is FormData) {
+        if (data.fields.isNotEmpty) {
+          ApiLogger.request("Form Fields:");
+          for (var field in data.fields) {
+            ApiLogger.request("  ${field.key}: ${field.value}");
+          }
+        }
+
+        if (data.files.isNotEmpty) {
+          ApiLogger.request("Form Files:");
+          for (var file in data.files) {
+            ApiLogger.request("  ${file.key}: ${file.value.filename}");
+          }
+        }
+      } else {
+        ApiLogger.request("Body: $data");
+      }
+    }
+
+    ApiLogger.divider("REQUEST");
   }
 
   void _logResponse(Uri uri, Response response) {
-    if (!kDebugMode) return;
+    if (!ApiLogger.enabled) return;
 
-    debugPrint("========== API RESPONSE ==========");
-    debugPrint("URL: $uri");
-    debugPrint("Status: ${response.statusCode}");
-    debugPrint("Data: ${response.data}");
-    debugPrint("==================================");
+    ApiLogger.divider("RESPONSE");
+
+    ApiLogger.response("URL: $uri");
+    ApiLogger.response("Status: ${response.statusCode}");
+
+    if (response.data != null) {
+      ApiLogger.response("Data:");
+      ApiLogger.response(response.data.toString());
+    }
+
+    ApiLogger.divider("RESPONSE");
   }
 }

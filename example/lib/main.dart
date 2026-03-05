@@ -1,28 +1,36 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:advanced_api_client/advanced_api_client.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   /// This bse URL for GET ALL, GET ONE, POST, PUT, PATCH, DELETE, LIST WITH PAGINATION
   // https://api.restful-api.dev
-  /// This bse URL for LOGIN, REFRESH TOKEN, and GET PROFILE
-  // https://api.escuelajs.co/api/v1
-  /// This bse URL for FILE UPLOAD
-  // https://api.escuelajs.co/api/v1
-  /// This bse URL for LIST WITH PAGINATION
+  /// This bse URL for LOGIN, REFRESH TOKEN, GET PROFILE, and OTHERS
   // https://api.escuelajs.co/api/v1
 
   await AdvancedApiClient.initialize(
     config: ApiConfig(
-      baseUrl: "https://api.escuelajs.co/api/v1",
+      baseUrl: "https://api.restful-api.dev",
       refreshConfig: RefreshConfig(
         path: "/auth/refresh-token",
         method: "POST",
-        body: {},
-        tokenParser: (data) => data["access_token"],
+        bodyBuilder: () async {
+          // get latest user_id from SharedPreferences
+          final prefs = await SharedPreferences.getInstance();
+          final userId = prefs.getString("user_id") ?? "";
+          return {
+            "from_source": 1,
+            "user_id": userId,
+          };
+        },
+        tokenParser: (data) => data["data"]["token"],
       ),
       interceptors: [],
+      enableLogs: kDebugMode,
     ),
   );
 
@@ -51,6 +59,10 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   String result = "";
   bool isLoading = false;
+
+  bool isUploading = false;
+  double uploadProgress = 0.0;
+  String? currentUploadId;
 
   void setLoading(bool value) {
     setState(() => isLoading = value);
@@ -183,7 +195,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ===========================
-  // LOGIN (EscuelaJS)
+  // LOGIN
   // ===========================
 
   Future<void> login() async {
@@ -191,17 +203,24 @@ class _HomeScreenState extends State<HomeScreen> {
 
     try {
       final response = await AdvancedApiClient.instance.post(
-        endpoint: "/auth/login",
+        endpoint: "/auth/super_admin/login",
         withToken: false,
         body: {
-          "email": "john@mail.com",
-          "password": "changeme",
+          "email": "raju@gmail.com",
+          "password": "SAdmin@123#",
+          "from_source": 1
         },
       );
 
-      final accessToken = response["access_token"];
+      final accessToken = response["data"]["token"];
+      final userId = response["data"]["uuid"];
 
+      // Save token to package
       await AdvancedApiClient.instance.tokenStorage.saveToken(accessToken);
+
+      // Save userId in SharedPreferences
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString("user_id", userId);
 
       result = "Login Success\nAccess Token Saved";
     } catch (e) {
@@ -212,7 +231,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ===========================
-  // GET PROFILE (EscuelaJS)
+  // GET PROFILE
   // ===========================
 
   Future<void> getProfile() async {
@@ -233,25 +252,109 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ===========================
-  // FILE UPLOAD
+  // SINGLE FILE UPLOAD
   // ===========================
 
   Future<void> uploadFile() async {
-    setLoading(true);
+    final picker = ImagePicker();
+    final pickedFile = await picker.pickImage(source: ImageSource.gallery);
+
+    if (pickedFile == null) return;
+
+    currentUploadId = AdvancedApiClient.instance.createUploadTask();
+
+    setState(() {
+      isUploading = true;
+      uploadProgress = 0;
+    });
 
     try {
       final response = await AdvancedApiClient.instance.uploadFile(
-        endpoint: "/files/upload",
-        filePath: "/storage/emulated/0/Download/test.png",
-        withToken: false,
+        endpoint: "/common/file-upload/image",
+        files: {
+          "image": [pickedFile.path],
+        },
+        uploadId: currentUploadId,
+        onProgress: (sent, total) {
+          setState(() {
+            uploadProgress = total > 0 ? sent / total : 0;
+          });
+        },
       );
 
-      result = "Uploaded:\n$response";
+      setState(() {
+        result = response["message"] ?? "Upload successful";
+      });
     } catch (e) {
-      result = "Upload Error:\n$e";
+      setState(() {
+        result = "Upload Error: $e";
+      });
+    } finally {
+      setState(() {
+        isUploading = false;
+        uploadProgress = 0;
+        currentUploadId = null;
+      });
     }
+  }
 
-    setLoading(false);
+  // ===========================
+  // MULTI FILE UPLOAD
+  // ===========================
+
+  Future<void> uploadMultipleImages() async {
+    try {
+      final picker = ImagePicker();
+      final List<XFile> pickedFiles = await picker.pickMultiImage();
+
+      if (pickedFiles.isEmpty) return;
+
+      currentUploadId = AdvancedApiClient.instance.createUploadTask();
+
+      setState(() {
+        isUploading = true;
+        uploadProgress = 0;
+      });
+
+      final filePaths = pickedFiles.map((e) => e.path).toList();
+
+      final response = await AdvancedApiClient.instance.uploadFile(
+        endpoint: "/common/file-upload/image",
+        files: {
+          "image": filePaths,
+        },
+        withToken: true,
+        uploadId: currentUploadId,
+        onProgress: (sent, total) {
+          setState(() {
+            uploadProgress = total > 0 ? sent / total : 0;
+          });
+        },
+      );
+
+      setState(() {
+        result = response["message"] ?? "Upload successful";
+      });
+    } catch (e) {
+      setState(() {
+        result = "Upload Error:\n$e";
+      });
+    } finally {
+      setState(() {
+        isUploading = false;
+        uploadProgress = 0;
+        currentUploadId = null;
+      });
+    }
+  }
+
+  // ===========================
+  // CANCEL UPLOAD
+  // ===========================
+  void cancelUpload() {
+    if (currentUploadId != null) {
+      AdvancedApiClient.instance.cancelUpload(currentUploadId!);
+    }
   }
 
   // ===========================
@@ -306,6 +409,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 ElevatedButton(
                     onPressed: uploadFile, child: const Text("UPLOAD")),
                 ElevatedButton(
+                  onPressed: uploadMultipleImages,
+                  child: const Text("UPLOAD MULTIPLE"),
+                ),
+                ElevatedButton(
                   onPressed: logout,
                   child: const Text("LOGOUT"),
                 ),
@@ -323,6 +430,22 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 20),
             if (isLoading) const CircularProgressIndicator(),
+            if (isUploading)
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  children: [
+                    LinearProgressIndicator(value: uploadProgress),
+                    const SizedBox(height: 8),
+                    Text("${(uploadProgress * 100).toStringAsFixed(0)} %"),
+                    const SizedBox(height: 8),
+                    ElevatedButton(
+                      onPressed: cancelUpload,
+                      child: const Text("Cancel Upload"),
+                    ),
+                  ],
+                ),
+              ),
             const SizedBox(height: 20),
             Expanded(
               child: SingleChildScrollView(
@@ -421,7 +544,7 @@ class _PaginatedObjectsScreenState extends State<PaginatedObjectsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Paginated Products")),
+      appBar: AppBar(title: const Text("Advanced API Client")),
       body: isLoading && objects.isEmpty
           ? const Center(child: CircularProgressIndicator())
           : error.isNotEmpty

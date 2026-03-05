@@ -30,6 +30,8 @@ Designed for scalability and real-world production apps.
 - 🛑 Global error callback
 - 🚪 Session termination support
 - 🧪 Works with Flutter & pure Dart
+- 🆕 Dynamic refresh token bodyBuilder support for passing runtime data (e.g., user_id from SharedPreferences)
+- 🛡 Safe retry after token refresh for file uploads
 
 ---
 
@@ -39,7 +41,7 @@ Add this to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  advanced_api_client: ^1.0.0
+  advanced_api_client: ^1.0.1
 ```
 
 Then run:
@@ -61,6 +63,25 @@ void main() async {
   await AdvancedApiClient.initialize(
     config: ApiConfig(
       baseUrl: "https://api.example.com",
+      refreshConfig: RefreshConfig(
+        path: "/auth/refresh",
+        method: "POST",
+        // Use bodyBuilder for dynamic runtime body
+        bodyBuilder: () async {
+          final prefs = await SharedPreferences.getInstance();
+          final userId = prefs.getString("user_id") ?? "";
+          return {"user_id": userId, "from_source": 1};
+        },
+        // or use body for static data
+        body: {
+          "from_source": 1
+        },
+        tokenParser: (data) => data["access_token"],
+        headers: {
+          "App-Version": "1.0.0",
+          "Platform": "Flutter",
+        },
+      ),
     ),
   );
 
@@ -94,12 +115,14 @@ class ApiConfig {
   final RefreshConfig? refreshConfig;
   final List<Interceptor>? interceptors;
   final void Function(DioException e, RequestOptions request)? onError;
+  final bool enableLogs;
 
   const ApiConfig({
     required this.baseUrl,
     this.refreshConfig,
     this.interceptors,
     this.onError,
+    this.enableLogs = true,
   });
 }
 ```
@@ -130,6 +153,14 @@ ApiConfig(
   refreshConfig: RefreshConfig(
     path: "/auth/refresh",
     method: "POST",
+    // Dynamic runtime body
+    bodyBuilder: () async {
+    final prefs = await SharedPreferences.getInstance();
+    final userId = prefs.getString("user_id") ?? "";
+    return {"user_id": userId, "from_source": 1};
+    },
+    // Static body
+    body: {"from_source": 1}
     tokenParser: (data) => data["access_token"],
   ),
 );
@@ -184,7 +215,10 @@ ApiConfig(
 ### GET
 
 ```dart
-await client.get(endpoint: "/users");
+await client.get(
+  endpoint: "/users",
+  headers: {"X-Custom-Header": "12345"},
+);
 ```
 
 ### POST
@@ -193,6 +227,7 @@ await client.get(endpoint: "/users");
 await client.post(
   endpoint: "/users",
   body: {"name": "John"},
+  headers: {"X-Custom-Header": "12345"},
 );
 ```
 
@@ -202,6 +237,7 @@ await client.post(
 await client.put(
   endpoint: "/users/1",
   body: {"name": "Updated"},
+  headers: {"X-Custom-Header": "12345"},
 );
 ```
 
@@ -211,6 +247,7 @@ await client.put(
 await client.patch(
   endpoint: "/users/1",
   body: {"status": "active"},
+  headers: {"X-Custom-Header": "12345"},
 );
 ```
 
@@ -231,11 +268,12 @@ final client = AdvancedApiClient.instance;
 ### Upload Single File
 
 ```dart
-await client.uploadFile(
-  endpoint: "/upload-single",
-  filePath: "path/to/user.png",
-  fileField: "profileImage",
-  fields: {"userId": "123"},
+await client.upload(
+  endpoint: "/common/file-upload/image",
+  files: {
+    "image": [pickedFile.path],
+  },
+  headers: {"X-Custom-Header": "12345"},
 );
 ```
 
@@ -244,14 +282,12 @@ await client.uploadFile(
 ### Upload Multiple Files (Same Field)
 
 ```dart
-await client.uploadFiles(
-  endpoint: "/upload-multiple",
-  files: [
-    "path/to/file1.png",
-    "path/to/file2.png",
-  ],
-  fileField: "attachments",
-  fields: {"userId": "123"},
+await client.upload(
+  endpoint: "/common/file-upload/image",
+  files: {
+    "image": filePaths, // List<String>
+  },
+  headers: {"X-Custom-Header": "12345"},
 );
 ```
 
@@ -260,13 +296,17 @@ await client.uploadFiles(
 ### Upload Multiple Files (Different Fields)
 
 ```dart
-await client.uploadMultipleFiles(
-  endpoint: "/upload-dynamic",
+await client.upload(
+  endpoint: "/upload",
   files: {
-    "userImage": "path/to/user.png",
-    "signature": "path/to/signature.png",
+    "profile_image": [profilePath],
+    "documents": documentPaths,
   },
-  fields: {"userId": "123"},
+  fields: {
+    "user_id": 1,
+    "type": "verification",
+  },
+  headers: {"X-Custom-Header": "12345"},
 );
 ```
 
@@ -303,7 +343,7 @@ AdvancedApiClient
  ├── RetryInterceptor
  ├── TokenStorage
  ├── ApiConfig
- ├── RefreshConfig
+ ├── RefreshConfig (supports bodyBuilder)
  └── ApiException
 ```
 
