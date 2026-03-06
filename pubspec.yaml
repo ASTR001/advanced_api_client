@@ -1,7 +1,7 @@
 name: advanced_api_client
 description: "Production-ready Flutter/Dart API client built on Dio with authentication, automatic token refresh, retry interceptor, file uploads, global error handling, and clean architecture."
 
-version: 1.0.1
+version: 1.0.2
 
 homepage: "https://github.com/yourusername/advanced_api_client"
 repository: "https://github.com/yourusername/advanced_api_client"

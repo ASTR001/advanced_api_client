@@ -4,6 +4,28 @@ All notable changes to this package will be documented in this file.
 
 ---
 
+## 1.0.2
+
+### 🚀 Improvements
+- Improved global session expiration handling without requiring BuildContext.
+- Improved retry safety for multipart uploads after token refresh.
+- Enhanced FormData rebuilding logic to prevent finalized stream reuse issues.
+- Improved logging clarity for refresh flow, retries, and upload progress.
+- Refactored internal _request() logic for better readability and maintainability.
+
+### 🛠 Bug Fixes
+- Fixed rare race condition when multiple requests attempted token refresh simultaneously.
+- Fixed edge case where CancelToken was not passed correctly to retried upload requests.
+- Fixed retry request headers not preserving original request headers.
+
+### Added
+- Better production-safe retry mechanism for requests with FormData.
+- Improved upload task cancellation support using CancelToken.
+- Support for dynamic body rebuild for retried multipart requests.
+- Additional debug logs for retry attempts and token refresh flow.
+
+---
+
 ## 1.0.1
 
 ### 🛠 Bug Fixes

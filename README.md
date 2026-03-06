@@ -12,9 +12,30 @@ A powerful, production-ready Flutter/Dart HTTP client built on top of `dio`.
 - Global error handling
 - Custom interceptors
 - Session termination
+- Request deduplication
+- Rate limiting
 - Clean architecture
 
 Designed for scalability and real-world production apps.
+
+---
+
+## 🚀 API Client Architecture
+```
+AdvancedApiClient
+├── RetryInterceptor
+├── AuthInterceptor
+│    ├── Token attach
+│    ├── Queue requests
+│    ├── Refresh lock
+│    ├── Retry failed calls
+│    └── Prevent multiple redirects
+├── Upload cancel tokens
+├── Request deduplication
+├── Rate limiting
+├── Global cancel
+└── SSL bypass (dev)
+```
 
 ---
 
@@ -30,8 +51,11 @@ Designed for scalability and real-world production apps.
 - 🛑 Global error callback
 - 🚪 Session termination support
 - 🧪 Works with Flutter & pure Dart
-- 🆕 Dynamic refresh token bodyBuilder support for passing runtime data (e.g., user_id from SharedPreferences)
+- 🆕 Dynamic refresh token bodyBuilder
 - 🛡 Safe retry after token refresh for file uploads
+- 📑 Global header support
+- ⚡ Request deduplication support
+-🚦 Rate limiting support
 
 ---
 
@@ -41,7 +65,7 @@ Add this to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  advanced_api_client: ^1.0.1
+  advanced_api_client: ^1.0.2
 ```
 
 Then run:
@@ -57,12 +81,33 @@ flutter pub get
 ## 1️⃣ Initialize (Recommended – Pre-init in `main()`)
 
 ```dart
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   await AdvancedApiClient.initialize(
     config: ApiConfig(
       baseUrl: "https://api.example.com",
+      enableAutoRefresh: true, // false to call onSessionExpired
+      onSessionExpired: () {
+        debugPrint("Session expired. Please login again");
+        final navigator = navigatorKey.currentState;
+
+        if (navigator == null) return;
+
+        // Navigate to login
+        navigator.pushNamedAndRemoveUntil(
+          "/login",
+              (route) => false,
+        );
+
+        // Show snackbar
+        ScaffoldMessenger.of(navigator.context).showSnackBar(
+          const SnackBar(
+            content: Text("Session expired. Please login again."),
+          ),
+        );
+      },
       refreshConfig: RefreshConfig(
         path: "/auth/refresh",
         method: "POST",
@@ -112,17 +157,25 @@ The `ApiConfig` class allows you to configure the API client behavior.
 ```dart
 class ApiConfig {
   final String baseUrl;
+  final bool enableAutoRefresh;
+  final void Function()? onSessionExpired;
   final RefreshConfig? refreshConfig;
   final List<Interceptor>? interceptors;
   final void Function(DioException e, RequestOptions request)? onError;
   final bool enableLogs;
+  final Map<String, dynamic>? headers;
+  final bool allowBadCertificates;
 
   const ApiConfig({
     required this.baseUrl,
+    this.enableAutoRefresh = true,
+    this.onSessionExpired,
     this.refreshConfig,
     this.interceptors,
     this.onError,
     this.enableLogs = true,
+    this.headers,
+    this.allowBadCertificates = false,
   });
 }
 ```
@@ -218,6 +271,7 @@ ApiConfig(
 await client.get(
   endpoint: "/users",
   headers: {"X-Custom-Header": "12345"},
+  rateLimit: Duration(seconds: 2),
 );
 ```
 
@@ -228,6 +282,7 @@ await client.post(
   endpoint: "/users",
   body: {"name": "John"},
   headers: {"X-Custom-Header": "12345"},
+  rateLimit: Duration(seconds: 2),
 );
 ```
 
@@ -238,6 +293,7 @@ await client.put(
   endpoint: "/users/1",
   body: {"name": "Updated"},
   headers: {"X-Custom-Header": "12345"},
+  rateLimit: Duration(seconds: 2),
 );
 ```
 
@@ -248,13 +304,17 @@ await client.patch(
   endpoint: "/users/1",
   body: {"status": "active"},
   headers: {"X-Custom-Header": "12345"},
+  rateLimit: Duration(seconds: 2),
 );
 ```
 
 ### DELETE
 
 ```dart
-await client.delete(endpoint: "/users/1");
+await client.delete(
+  endpoint: "/users/1",
+  rateLimit: Duration(seconds: 2),
+);
 ```
 
 ---
@@ -274,6 +334,7 @@ await client.upload(
     "image": [pickedFile.path],
   },
   headers: {"X-Custom-Header": "12345"},
+  rateLimit: Duration(seconds: 2),
 );
 ```
 
@@ -288,6 +349,7 @@ await client.upload(
     "image": filePaths, // List<String>
   },
   headers: {"X-Custom-Header": "12345"},
+  rateLimit: Duration(seconds: 2),
 );
 ```
 
@@ -307,6 +369,7 @@ await client.upload(
     "type": "verification",
   },
   headers: {"X-Custom-Header": "12345"},
+  rateLimit: Duration(seconds: 2),
 );
 ```
 
@@ -332,22 +395,6 @@ Built-in retry interceptor supports:
 - Optional exponential backoff
 
 Helps reduce random network failures in production.
-
----
-
-# 🏗 Architecture
-
-```
-AdvancedApiClient
- ├── AuthInterceptor
- ├── RetryInterceptor
- ├── TokenStorage
- ├── ApiConfig
- ├── RefreshConfig (supports bodyBuilder)
- └── ApiException
-```
-
-Clean separation of concerns and extensibility.
 
 ---
 

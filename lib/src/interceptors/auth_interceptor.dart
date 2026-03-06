@@ -4,46 +4,58 @@ import '../../advanced_api_client.dart';
 
 class AuthInterceptor extends Interceptor {
   final AdvancedApiClient client;
+
   Completer<bool>? _refreshCompleter;
+
+  /// Prevent multiple redirects
+  bool _sessionExpiredHandled = false;
+
+  /// Queue for requests waiting for token refresh
+  final List<_QueuedRequest> _requestQueue = [];
 
   AuthInterceptor(this.client);
 
   // ==========================================================
   // 🔐 ATTACH TOKEN
   // ==========================================================
+
   @override
   void onRequest(
     RequestOptions options,
     RequestInterceptorHandler handler,
-  ) {
-    _handleRequest(options, handler);
-  }
-
-  Future<void> _handleRequest(
-    RequestOptions options,
-    RequestInterceptorHandler handler,
   ) async {
+    /// Wait if refresh running
+    if (_refreshCompleter != null && options.extra["skipRefreshWait"] != true) {
+      ApiLogger.auth("Waiting for token refresh before sending request...");
+      try {
+        await _refreshCompleter!.future;
+      } catch (_) {}
+    }
+
     final token = await client.tokenStorage.getToken();
 
-    if (token != null && options.headers["Skip-Auth"] != true) {
+    if (token != null &&
+        options.headers["Skip-Auth"] != true &&
+        options.extra["skipAuthAttach"] != true) {
       options.headers["Authorization"] = "Bearer $token";
-      ApiLogger.auth("Token attached to request");
     }
 
     options.headers.remove("Skip-Auth");
+
     handler.next(options);
   }
 
   // ==========================================================
-  // 🔄 RESPONSE INTERCEPTOR (CHECK AUTH ERRORS)
+  // 🔄 RESPONSE INTERCEPTOR
   // ==========================================================
+
   @override
   void onResponse(Response response, ResponseInterceptorHandler handler) async {
     final data = response.data;
 
     if (data is Map<String, dynamic>) {
       final int? code = data["code"];
-      final String message = data["message"]?.toString().toLowerCase() ?? "";
+      final String message = data["message"]?.toLowerCase() ?? "";
 
       final bool isAuthError = code == 401 ||
           code == 403 ||
@@ -53,9 +65,21 @@ class AuthInterceptor extends Interceptor {
       if (isAuthError) {
         final request = response.requestOptions;
 
-        // Prevent infinite retry loops
+        /// 🚨 refresh disabled
+        if (!client.config.enableAutoRefresh ||
+            client.config.refreshConfig == null) {
+          _handleSessionExpired();
+          return handler.reject(
+            DioException(
+              requestOptions: request,
+              response: response,
+              type: DioExceptionType.badResponse,
+            ),
+          );
+        }
+
+        /// prevent infinite retry
         if (request.extra["retrying"] == true) {
-          ApiLogger.auth("Retry already attempted. Forwarding error");
           return handler.reject(
             DioException(
               requestOptions: request,
@@ -65,47 +89,28 @@ class AuthInterceptor extends Interceptor {
           );
         }
 
-        ApiLogger.auth("Auth error detected, refreshing token...");
+        final completer = Completer<Response>();
 
-        // Wait for ongoing refresh or perform new one
-        final refreshSuccess = await _refreshToken();
+        _requestQueue.add(
+          _QueuedRequest(
+            requestOptions: request,
+            completer: completer,
+          ),
+        );
 
-        if (!refreshSuccess) {
-          ApiLogger.auth("Token refresh failed. Forwarding error.");
-          return handler.reject(
-            DioException(
-              requestOptions: request,
-              response: response,
-              type: DioExceptionType.badResponse,
-            ),
-          );
+        if (_refreshCompleter == null) {
+          await _startTokenRefresh();
         }
-
-        // Retry original request once
-        request.extra["retrying"] = true;
-
-        // If this was a FormData upload, rebuild it
-        if (request.extra.containsKey("_dataBuilder")) {
-          final builder = request.extra["_dataBuilder"] as dynamic Function();
-          request.data = builder(); // rebuild fresh FormData
-        }
-
-        // Attach new token
-        final newToken = await client.tokenStorage.getToken();
-        if (newToken != null) {
-          request.headers["Authorization"] = "Bearer $newToken";
-        }
-
-        ApiLogger.auth("Retrying original request after refresh...");
 
         try {
-          final retryResponse = await client.dio.fetch(request);
+          final retryResponse = await completer.future;
           handler.resolve(retryResponse);
         } catch (e) {
           handler.reject(
             DioException(
               requestOptions: request,
-              type: DioExceptionType.unknown,
+              response: response,
+              type: DioExceptionType.badResponse,
               error: e,
             ),
           );
@@ -119,67 +124,173 @@ class AuthInterceptor extends Interceptor {
   }
 
   // ==========================================================
-  // ❗ ERROR HANDLING + AUTO REFRESH
+  // ❗ ERROR INTERCEPTOR
   // ==========================================================
+
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) async {
-    ApiLogger.auth("onError triggered");
-
     if (CancelToken.isCancel(err)) {
-      ApiLogger.auth("Request cancelled");
       return handler.next(err);
     }
 
     final statusCode = err.response?.statusCode;
-    final isAuthError =
+
+    final bool isAuthError =
         statusCode == 401 || statusCode == 403 || _isTokenExpired(err);
 
-    if (!isAuthError || client.config.refreshConfig == null) {
+    if (!isAuthError) {
       return handler.next(err);
     }
 
-    ApiLogger.auth("Authentication error detected. Attempting refresh...");
+    /// refresh disabled
+    if (!client.config.enableAutoRefresh ||
+        client.config.refreshConfig == null) {
+      _handleSessionExpired();
+      return handler.next(err);
+    }
 
     final request = err.requestOptions;
 
     if (request.extra["retrying"] == true) {
-      ApiLogger.auth("Retry already attempted. Preventing loop.");
       return handler.next(err);
     }
 
+    final completer = Completer<Response>();
+
+    _requestQueue.add(
+      _QueuedRequest(
+        requestOptions: request,
+        completer: completer,
+      ),
+    );
+
+    if (_refreshCompleter == null) {
+      await _startTokenRefresh();
+    }
+
     try {
-      final success = await _refreshToken();
-
-      if (!success) {
-        ApiLogger.auth("Token refresh failed. Forwarding error.");
-        return handler.next(err);
-      }
-
-      request.extra["retrying"] = true;
-
-      final newToken = await client.tokenStorage.getToken();
-      if (newToken != null) {
-        request.headers["Authorization"] = "Bearer $newToken";
-      }
-
-      ApiLogger.auth("Retrying original request...");
-
-      final retryResponse = await client.dio.fetch(request);
-      handler.resolve(retryResponse);
-    } catch (e) {
-      ApiLogger.error("Retry failed: $e");
+      final response = await completer.future;
+      handler.resolve(response);
+    } catch (_) {
       handler.next(err);
     }
   }
 
   // ==========================================================
+  // 🔄 START TOKEN REFRESH
+  // ==========================================================
+
+  Future<void> _startTokenRefresh() async {
+    if (_refreshCompleter != null) return;
+
+    ApiLogger.auth("Starting token refresh...");
+
+    _refreshCompleter = Completer<bool>();
+
+    bool refreshSuccess = false;
+
+    try {
+      refreshSuccess = await _refreshToken();
+    } catch (e) {
+      ApiLogger.error("Refresh exception: $e");
+    }
+
+    if (refreshSuccess) {
+      ApiLogger.auth("Token refresh success → retrying requests");
+
+      final token = await client.tokenStorage.getToken();
+
+      for (final queued in _requestQueue) {
+        final request = queued.requestOptions;
+
+        request.extra["retrying"] = true;
+        request.extra["skipRefreshWait"] = true;
+
+        /// rebuild FormData
+        if (request.extra.containsKey("_dataBuilder")) {
+          final builder = request.extra["_dataBuilder"] as dynamic Function();
+          request.data = builder();
+        }
+
+        if (token != null) {
+          request.headers["Authorization"] = "Bearer $token";
+        }
+
+        try {
+          final response = await client.dio.fetch(request);
+          queued.completer.complete(response);
+        } catch (e) {
+          queued.completer.completeError(e);
+        }
+      }
+    } else {
+      ApiLogger.auth("Refresh failed");
+
+      for (final queued in _requestQueue) {
+        queued.completer.completeError("Token refresh failed");
+      }
+
+      _handleSessionExpired();
+    }
+
+    _requestQueue.clear();
+
+    _refreshCompleter!.complete(refreshSuccess);
+    _refreshCompleter = null;
+  }
+
+  // ==========================================================
+  // 🔄 REFRESH TOKEN
+  // ==========================================================
+
+  Future<bool> _refreshToken() async {
+    final refreshConfig = client.config.refreshConfig!;
+    final accessToken = await client.tokenStorage.getToken();
+
+    if (accessToken == null) {
+      return false;
+    }
+
+    final dioToUse = Dio(client.dio.options);
+
+    final options = refreshConfig.toOptions().copyWith(
+      headers: {
+        "Authorization": "Bearer $accessToken",
+        if (refreshConfig.headers != null) ...refreshConfig.headers!,
+      },
+      extra: {"skipRefresh": true},
+    );
+
+    final body = refreshConfig.bodyBuilder != null
+        ? await refreshConfig.bodyBuilder!()
+        : (refreshConfig.body ?? {});
+
+    final response = await dioToUse.request(
+      refreshConfig.path,
+      data: body,
+      queryParameters: refreshConfig.query,
+      options: options,
+    );
+
+    final newToken = refreshConfig.tokenParser(response.data);
+
+    if (newToken != null) {
+      await client.tokenStorage.saveToken(newToken);
+      return true;
+    }
+
+    return false;
+  }
+
+  // ==========================================================
   // 🔎 TOKEN EXPIRED CHECK
   // ==========================================================
+
   bool _isTokenExpired(DioException err) {
     final data = err.response?.data;
 
     if (data is Map<String, dynamic>) {
-      final message = data["message"]?.toString().toLowerCase() ?? "";
+      final message = data["message"]?.toLowerCase() ?? "";
       return message.contains("token expired") ||
           message.contains("invalid token");
     }
@@ -188,78 +299,26 @@ class AuthInterceptor extends Interceptor {
   }
 
   // ==========================================================
-  // 🔄 REFRESH TOKEN (Safe + Clean Logs)
+  // 🚨 SESSION EXPIRED HANDLER
   // ==========================================================
-  Future<bool> _refreshToken() async {
-    // Wait for ongoing refresh if exists
-    if (_refreshCompleter != null) {
-      ApiLogger.auth("Refresh already in progress. Waiting...");
-      await _refreshCompleter!.future;
-      final token = await client.tokenStorage.getToken();
-      return token != null;
-    }
 
-    ApiLogger.auth("Starting token refresh...");
-    _refreshCompleter = Completer<bool>();
+  void _handleSessionExpired() {
+    if (_sessionExpiredHandled) return;
 
-    try {
-      final refreshConfig = client.config.refreshConfig!;
-      final accessToken = await client.tokenStorage.getToken();
+    _sessionExpiredHandled = true;
 
-      if (accessToken == null) {
-        ApiLogger.auth("No access token available for refresh!");
-        _refreshCompleter!.complete(false);
-        return false;
-      }
+    ApiLogger.auth("Session expired → redirecting");
 
-      // Build Dio instance for refresh request
-      final dioToUse = Dio(BaseOptions(
-        baseUrl: client.config.baseUrl,
-        connectTimeout: const Duration(seconds: 50),
-        receiveTimeout: const Duration(seconds: 50),
-        sendTimeout: const Duration(seconds: 50),
-      ));
-
-      // Merge headers: Skip-Auth + Bearer token
-      final options = refreshConfig.toOptions().copyWith(
-        headers: {
-          "Authorization": "Bearer $accessToken",
-          if (refreshConfig.headers != null) ...refreshConfig.headers!,
-        },
-      );
-
-      // Build body for refresh request
-      final body = refreshConfig.bodyBuilder != null
-          ? await refreshConfig.bodyBuilder!()
-          : (refreshConfig.body ?? {});
-
-      final response = await dioToUse.request(
-        refreshConfig.path,
-        data: body,
-        queryParameters: refreshConfig.query,
-        options: options,
-      );
-
-      // Parse new token
-      final newAccessToken = refreshConfig.tokenParser(response.data);
-      if (newAccessToken != null) {
-        await client.tokenStorage.saveToken(newAccessToken);
-        ApiLogger.auth("Token refresh SUCCESS");
-        _refreshCompleter!.complete(true);
-        return true;
-      }
-
-      ApiLogger.auth(
-          "Refresh token parser returned null. Please check API config token parser value");
-      _refreshCompleter!.complete(false);
-      return false;
-    } catch (e) {
-      ApiLogger.error("Refresh call failed: $e");
-      if (!_refreshCompleter!.isCompleted) _refreshCompleter!.complete(false);
-      return false;
-    } finally {
-      Future.microtask(() => _refreshCompleter = null);
-      ApiLogger.auth("Refresh cycle completed");
-    }
+    client.config.onSessionExpired?.call();
   }
+}
+
+class _QueuedRequest {
+  final RequestOptions requestOptions;
+  final Completer<Response> completer;
+
+  _QueuedRequest({
+    required this.requestOptions,
+    required this.completer,
+  });
 }

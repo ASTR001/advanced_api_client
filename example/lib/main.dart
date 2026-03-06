@@ -4,6 +4,8 @@ import 'package:advanced_api_client/advanced_api_client.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -15,6 +17,28 @@ void main() async {
   await AdvancedApiClient.initialize(
     config: ApiConfig(
       baseUrl: "https://api.restful-api.dev",
+      interceptors: [],
+      enableLogs: kDebugMode,
+      enableAutoRefresh: true,
+      onSessionExpired: () {
+        debugPrint("Session expired. Please login again");
+        final navigator = navigatorKey.currentState;
+
+        if (navigator == null) return;
+
+        // Navigate to login
+        navigator.pushNamedAndRemoveUntil(
+          "/login",
+          (route) => false,
+        );
+
+        // Show snackbar
+        ScaffoldMessenger.of(navigator.context).showSnackBar(
+          const SnackBar(
+            content: Text("Session expired. Please login again."),
+          ),
+        );
+      },
       refreshConfig: RefreshConfig(
         path: "/auth/refresh-token",
         method: "POST",
@@ -29,8 +53,6 @@ void main() async {
         },
         tokenParser: (data) => data["data"]["token"],
       ),
-      interceptors: [],
-      enableLogs: kDebugMode,
     ),
   );
 

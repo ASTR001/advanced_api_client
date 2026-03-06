@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../advanced_api_client.dart';
 
@@ -14,6 +16,12 @@ class AdvancedApiClient {
 
   final Map<String, CancelToken> _uploadTokens = {};
 
+  /// Prevent duplicate API calls
+  final Map<String, Future<dynamic>> _runningRequests = {};
+
+  /// Rate limiting tracker
+  final Map<String, DateTime> _rateLimitTracker = {};
+
   CancelToken _globalCancelToken = CancelToken();
 
   // ==========================================================
@@ -26,20 +34,39 @@ class AdvancedApiClient {
   }) : dio = Dio(
           BaseOptions(
             baseUrl: config.baseUrl,
-            connectTimeout: const Duration(seconds: 50),
-            receiveTimeout: const Duration(seconds: 50),
-            sendTimeout: const Duration(seconds: 50),
+            connectTimeout: const Duration(seconds: 60),
+            receiveTimeout: const Duration(seconds: 60),
+            sendTimeout: const Duration(seconds: 60),
           ),
         ) {
-    // Retry FIRST
+    // SSL CERTIFICATE HANDLING
+    if (config.allowBadCertificates) {
+      final adapter = dio.httpClientAdapter as IOHttpClientAdapter;
+
+      adapter.createHttpClient = () {
+        final client = HttpClient();
+
+        client.badCertificateCallback =
+            (X509Certificate cert, String host, int port) {
+          ApiLogger.auth("Bad SSL certificate detected for host: $host:$port");
+
+          /// Allow connection (DEV ONLY)
+          return true;
+        };
+
+        return client;
+      };
+    }
+
+    // RETRY INTERCEPTOR
     dio.interceptors.add(RetryInterceptor(dio));
 
-    // Custom interceptors
+    // CUSTOM INTERCEPTORS
     if (config.interceptors != null) {
       dio.interceptors.addAll(config.interceptors!);
     }
 
-    // AUTH LAST
+    // AUTH INTERCEPTOR (LAST)
     dio.interceptors.add(AuthInterceptor(this));
 
     ApiLogger.request("AdvancedApiClient initialized");
@@ -94,6 +121,39 @@ class AdvancedApiClient {
   }
 
   // ==========================================================
+  // 🌐 REQUEST FINGERPRINT
+  // ==========================================================
+  String _requestFingerprint(
+    String method,
+    String endpoint,
+    Map<String, dynamic>? query,
+    dynamic body,
+  ) {
+    return "$method|$endpoint|${query.toString()}|${body.toString()}";
+  }
+
+  // ==========================================================
+  // 🌐 RATE LIMIT CHECK
+  // ==========================================================
+  bool _isRateLimited(String key, Duration limit) {
+    final last = _rateLimitTracker[key];
+
+    if (last == null) {
+      _rateLimitTracker[key] = DateTime.now();
+      return false;
+    }
+
+    final diff = DateTime.now().difference(last);
+
+    if (diff < limit) {
+      return true;
+    }
+
+    _rateLimitTracker[key] = DateTime.now();
+    return false;
+  }
+
+  // ==========================================================
   // 🌐 CORE REQUEST
   // ==========================================================
 
@@ -107,15 +167,40 @@ class AdvancedApiClient {
     Map<String, dynamic>? headers,
     void Function(int sent, int total)? onSendProgress,
     dynamic Function()? dataBuilder,
+    Duration? rateLimit,
   }) async {
+    final effectiveRateLimit = rateLimit ?? const Duration(seconds: 2);
+
+    final fingerprint = _requestFingerprint(
+      method,
+      endpoint,
+      query,
+      data,
+    );
+
+    /// 🚀 REQUEST DEDUPLICATION
+    if (_runningRequests.containsKey(fingerprint)) {
+      ApiLogger.request(
+          "Duplicate request detected → returning existing future");
+      return _runningRequests[fingerprint];
+    }
+
+    /// 🚀 RATE LIMIT
+    if (_isRateLimited(fingerprint, effectiveRateLimit)) {
+      ApiLogger.request("Rate limit triggered ($effectiveRateLimit)");
+      throw ApiException(
+        message: "Too many requests. Please wait.",
+      );
+    }
+
     final safeQuery = query?.map(
       (k, v) => MapEntry(k, v?.toString()),
     );
 
     final mergedHeaders = {
-      if (config.headers != null) ...config.headers!, // global headers
-      if (!withToken) "Skip-Auth": true, // auth skip
-      if (headers != null) ...headers, // request headers
+      if (config.headers != null) ...config.headers!,
+      if (!withToken) "Skip-Auth": true,
+      if (headers != null) ...headers,
     };
 
     final options = Options(
@@ -123,50 +208,63 @@ class AdvancedApiClient {
       headers: mergedHeaders,
     );
 
-    final uri = Uri.parse(dio.options.baseUrl + endpoint)
+    final uri = Uri.parse("${dio.options.baseUrl}$endpoint")
         .replace(queryParameters: safeQuery);
 
     _logRequest(uri, method, data, options.headers);
 
-    final safeOptions = (options).copyWith(
+    final safeOptions = options.copyWith(
       extra: {
         if (dataBuilder != null) "_dataBuilder": dataBuilder,
-        if (options.extra != null)
-          ...options.extra!, // preserve any existing extras
+        if (options.extra != null) ...options.extra!,
       },
     );
 
-    try {
-      final response = await dio.request(
-        endpoint,
-        data: data,
-        queryParameters: safeQuery,
-        options: safeOptions,
-        cancelToken: cancelToken ?? _globalCancelToken,
-        onSendProgress: onSendProgress,
-      );
+    final startTime = DateTime.now();
 
-      _logResponse(uri, response);
+    final future = () async {
+      try {
+        final response = await dio.request(
+          endpoint,
+          data: data,
+          queryParameters: safeQuery,
+          options: safeOptions,
+          cancelToken: cancelToken ?? _globalCancelToken,
+          onSendProgress: onSendProgress,
+        );
 
-      if (response.statusCode != null &&
-          response.statusCode! >= 200 &&
-          response.statusCode! < 300) {
-        return response.data;
+        final duration = DateTime.now().difference(startTime);
+
+        _logResponse(uri, response, duration);
+
+        if (response.statusCode != null &&
+            response.statusCode! >= 200 &&
+            response.statusCode! < 300) {
+          return response.data;
+        }
+
+        throw ApiException(
+          message: "HTTP Error ${response.statusCode}",
+          statusCode: response.statusCode,
+          data: response.data,
+        );
+      } on DioException catch (e) {
+        final errorBody = e.response?.data;
+
+        ApiLogger.error(
+          "$method $uri → ${e.response?.statusCode} ${errorBody ?? e.error ?? 'Unknown error'}",
+        );
+
+        throw _handleError(e);
+      } finally {
+        /// remove running request
+        _runningRequests.remove(fingerprint);
       }
+    }();
 
-      throw ApiException(
-        message: "HTTP Error ${response.statusCode}",
-        statusCode: response.statusCode,
-        data: response.data,
-      );
-    } on DioException catch (e) {
-      final errorBody = e.response?.data;
+    _runningRequests[fingerprint] = future;
 
-      ApiLogger.error(
-        "$method $uri → ${e.response?.statusCode} ${errorBody ?? e.error ?? 'Unknown error'}",
-      );
-      throw _handleError(e);
-    }
+    return future;
   }
 
   // ==========================================================
@@ -178,6 +276,7 @@ class AdvancedApiClient {
     Map<String, dynamic>? query,
     bool withToken = true,
     Map<String, dynamic>? headers,
+    Duration? rateLimit,
   }) =>
       _request(
         endpoint: endpoint,
@@ -185,6 +284,7 @@ class AdvancedApiClient {
         query: query,
         withToken: withToken,
         headers: headers,
+        rateLimit: rateLimit,
       );
 
   Future<dynamic> post({
@@ -192,6 +292,7 @@ class AdvancedApiClient {
     dynamic body,
     bool withToken = true,
     Map<String, dynamic>? headers,
+    Duration? rateLimit,
   }) =>
       _request(
         endpoint: endpoint,
@@ -199,6 +300,7 @@ class AdvancedApiClient {
         data: body,
         withToken: withToken,
         headers: headers,
+        rateLimit: rateLimit,
       );
 
   Future<dynamic> put({
@@ -206,6 +308,7 @@ class AdvancedApiClient {
     dynamic body,
     bool withToken = true,
     Map<String, dynamic>? headers,
+    Duration? rateLimit,
   }) =>
       _request(
         endpoint: endpoint,
@@ -213,6 +316,7 @@ class AdvancedApiClient {
         data: body,
         withToken: withToken,
         headers: headers,
+        rateLimit: rateLimit,
       );
 
   Future<dynamic> patch({
@@ -220,6 +324,7 @@ class AdvancedApiClient {
     dynamic body,
     bool withToken = true,
     Map<String, dynamic>? headers,
+    Duration? rateLimit,
   }) =>
       _request(
         endpoint: endpoint,
@@ -227,6 +332,7 @@ class AdvancedApiClient {
         data: body,
         withToken: withToken,
         headers: headers,
+        rateLimit: rateLimit,
       );
 
   Future<dynamic> delete({
@@ -234,6 +340,7 @@ class AdvancedApiClient {
     dynamic body,
     bool withToken = true,
     Map<String, dynamic>? headers,
+    Duration? rateLimit,
   }) =>
       _request(
         endpoint: endpoint,
@@ -241,6 +348,7 @@ class AdvancedApiClient {
         data: body,
         withToken: withToken,
         headers: headers,
+        rateLimit: rateLimit,
       );
 
   // ==========================================================
@@ -255,6 +363,7 @@ class AdvancedApiClient {
     void Function(int sent, int total)? onProgress,
     String? uploadId,
     Map<String, dynamic>? headers,
+    Duration? rateLimit,
   }) async {
     if (files.isEmpty) throw Exception("No files provided");
 
@@ -274,6 +383,7 @@ class AdvancedApiClient {
       );
 
     CancelToken? token;
+
     if (uploadId != null) {
       token = _uploadTokens.putIfAbsent(uploadId, () => CancelToken());
     }
@@ -290,10 +400,10 @@ class AdvancedApiClient {
         cancelToken: token,
         headers: {
           "Content-Type": "multipart/form-data",
-          if (config.headers != null) ...config.headers!, // global headers
           if (headers != null) ...headers, // request headers
         },
         onSendProgress: onProgress,
+        rateLimit: rateLimit,
       );
     } finally {
       if (uploadId != null) _uploadTokens.remove(uploadId);
@@ -332,6 +442,14 @@ class AdvancedApiClient {
     if (!_globalCancelToken.isCancelled) {
       _globalCancelToken.cancel("Session terminated");
     }
+
+    // cancel all uploads
+    for (final token in _uploadTokens.values) {
+      if (!token.isCancelled) {
+        token.cancel("Session terminated");
+      }
+    }
+    _uploadTokens.clear();
 
     await tokenStorage.clear();
     _globalCancelToken = CancelToken();
@@ -434,13 +552,14 @@ class AdvancedApiClient {
     ApiLogger.divider("REQUEST");
   }
 
-  void _logResponse(Uri uri, Response response) {
+  void _logResponse(Uri uri, Response response, Duration duration) {
     if (!ApiLogger.enabled) return;
 
     ApiLogger.divider("RESPONSE");
 
     ApiLogger.response("URL: $uri");
     ApiLogger.response("Status: ${response.statusCode}");
+    ApiLogger.response("Time: ${duration.inMilliseconds} ms");
 
     if (response.data != null) {
       ApiLogger.response("Data:");
